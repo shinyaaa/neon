@@ -12,6 +12,8 @@ use sd_notify::NotifyState;
 use tokio::runtime::Handle;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinError;
+use tokio_stream::wrappers::SignalStream;
+use tokio_stream::StreamMap;
 use utils::logging::SecretString;
 
 use std::env::{var, VarError};
@@ -503,12 +505,15 @@ async fn start_safekeeper(conf: SafeKeeperConf) -> Result<()> {
 
     set_build_info_metric(GIT_VERSION, BUILD_TAG);
 
-    // TODO: update tokio-stream, convert to real async Stream with
-    // SignalStream, map it to obtain missing signal name, combine streams into
-    // single stream we can easily sit on.
-    let mut sigquit_stream = signal(SignalKind::quit())?;
-    let mut sigint_stream = signal(SignalKind::interrupt())?;
-    let mut sigterm_stream = signal(SignalKind::terminate())?;
+    let sigquit_stream = SignalStream::new(signal(SignalKind::quit())?);
+    let sigint_stream = SignalStream::new(signal(SignalKind::interrupt())?);
+    let sigterm_stream = SignalStream::new(signal(SignalKind::terminate())?);
+
+    // Create a StreamMap to combine all signal streams
+    let mut all_signals = StreamMap::new();
+    all_signals.insert("SIGQUIT", sigquit_stream);
+    all_signals.insert("SIGINT", sigint_stream);
+    all_signals.insert("SIGTERM", sigterm_stream);
 
     // Notify systemd that we are ready. This is important as currently loading
     // timelines takes significant time (~30s in busy regions).
@@ -523,10 +528,9 @@ async fn start_safekeeper(conf: SafeKeeperConf) -> Result<()> {
         }
         // On any shutdown signal, log receival and exit. Additionally, handling
         // SIGQUIT prevents coredump.
-        _ = sigquit_stream.recv() => info!("received SIGQUIT, terminating"),
-        _ = sigint_stream.recv() => info!("received SIGINT, terminating"),
-        _ = sigterm_stream.recv() => info!("received SIGTERM, terminating")
-
+        Some((signal_name, _)) = all_signals.next() => {
+            info!("received {}, terminating", signal_name);
+        }
     };
     std::process::exit(0);
 }
